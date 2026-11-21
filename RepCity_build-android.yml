@@ -1,0 +1,101 @@
+name: RepCity Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build signed-ready release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Extract and validate RepCity source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$(find . -maxdepth 2 -type f -iname 'RepCity_*.zip' -print -quit)"
+          if [[ -z "${ARCHIVE}" ]]; then
+            echo 'ERROR: Upload the RepCity_*.zip source archive to the repository root.'
+            exit 1
+          fi
+          mkdir -p source
+          unzip -q "$ARCHIVE" -d source
+          PUBSPEC="$(find source -type f -name pubspec.yaml -print -quit)"
+          if [[ -z "${PUBSPEC}" ]]; then
+            echo 'ERROR: pubspec.yaml was not found in the uploaded archive.'
+            exit 1
+          fi
+          SOURCE_DIR="$(dirname "$PUBSPEC")"
+          test -f "$SOURCE_DIR/lib/main.dart"
+          test -f "$SOURCE_DIR/lib/services/cloud_sync.dart"
+          python3 - "$SOURCE_DIR" <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          files = [root / 'pubspec.yaml', root / 'lib/main.dart', root / 'lib/services/cloud_sync.dart']
+          for path in files:
+              data = path.read_bytes()
+              data.decode('utf-8', errors='strict')
+              if data.startswith(b'\\xef\\xbb\\xbf'):
+                  raise SystemExit(f'ERROR: UTF-8 BOM found in {path}')
+              print(f'UTF-8 OK: {path}')
+          PY
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Generate Android project and install app source
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter create --platforms=android --org com.repcity --project-name repcity build_app
+          cp "$SOURCE_DIR/pubspec.yaml" build_app/pubspec.yaml
+          rm -rf build_app/lib
+          cp -R "$SOURCE_DIR/lib" build_app/lib
+          if [[ -d "$SOURCE_DIR/assets" ]]; then cp -R "$SOURCE_DIR/assets" build_app/assets; fi
+
+      - name: Resolve Flutter packages
+        working-directory: build_app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: build_app
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--release)
+          if [[ -n "$SUPABASE_URL" && -n "$SUPABASE_PUBLISHABLE_KEY" ]]; then
+            ARGS+=("--dart-define=SUPABASE_URL=$SUPABASE_URL")
+            ARGS+=("--dart-define=SUPABASE_PUBLISHABLE_KEY=$SUPABASE_PUBLISHABLE_KEY")
+          else
+            echo 'Supabase secrets are not configured; APK will build with local-only mode.'
+          fi
+          flutter build apk "${ARGS[@]}"
+
+      - name: Publish APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RepCity-Android-APK
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
